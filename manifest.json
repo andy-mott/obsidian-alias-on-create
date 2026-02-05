@@ -1,7 +1,7 @@
 {
   "id": "alias-on-create",
   "name": "Alias on Create",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "minAppVersion": "1.0.0",
   "description": "When clicking an unresolved wikilink, automatically adds an alias to preserve the original link text and inserts it into the new file's frontmatter.",
   "author": "Andy Mott",

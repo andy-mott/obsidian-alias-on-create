@@ -1,4 +1,4 @@
-import { Plugin, TFile, MarkdownView, Notice } from "obsidian";
+import { Plugin, TFile, Notice } from "obsidian";
 
 /**
  * Alias on Create
@@ -6,52 +6,57 @@ import { Plugin, TFile, MarkdownView, Notice } from "obsidian";
  * Intercepts the creation of new files from unresolved wikilinks.
  * When a new file is created by clicking [[something]], the plugin:
  *   1. Rewrites [[something]] → [[something|something]] in the source file
- *   2. Adds `aliases: [something]` to the new file's frontmatter
+ *   2. Adds aliases to the new file's frontmatter, preserving any existing
+ *      pipe aliases (e.g. [[something|my alias]] → adds "my alias")
  *
- * This lets you freely rename the new note (e.g. "something" → "Something (concept)")
- * while the original link continues to display the original text.
+ * This lets you freely rename the new note while original links keep
+ * displaying their intended text.
  */
 export default class AliasOnCreatePlugin extends Plugin {
-  // Track which files existed before, so we can detect genuinely new files
   private knownFiles: Set<string> = new Set();
+  private ready: boolean = false;
 
   async onload() {
     console.log("Alias on Create: loaded");
 
-    // Snapshot every file path that already exists
     this.app.workspace.onLayoutReady(() => {
       for (const file of this.app.vault.getFiles()) {
         this.knownFiles.add(file.path);
       }
+      console.log(`Alias on Create: ready, tracking ${this.knownFiles.size} existing files`);
+      this.ready = true;
+
+      this.registerEvent(
+        this.app.vault.on("create", async (file) => {
+          if (!this.ready) return;
+          if (!(file instanceof TFile)) return;
+          if (file.extension !== "md") return;
+
+          if (this.knownFiles.has(file.path)) return;
+          this.knownFiles.add(file.path);
+
+          const newFileName = file.basename;
+
+          await sleep(300);
+
+          const linkInfo = await this.findMatchingLinks(newFileName, file);
+
+          if (!linkInfo.hasLinks) {
+            console.log(`Alias on Create: no matching links found for "${newFileName}", skipping`);
+            return;
+          }
+
+          console.log(`Alias on Create: found links for "${newFileName}" with aliases:`, linkInfo.aliases);
+
+          await this.patchBareLinks(newFileName, file);
+
+          for (const alias of linkInfo.aliases) {
+            await this.addAliasFrontmatter(file, alias);
+          }
+        })
+      );
     });
 
-    // Listen for file creation events
-    this.registerEvent(
-      this.app.vault.on("create", async (file) => {
-        if (!(file instanceof TFile)) return;
-        if (file.extension !== "md") return;
-
-        // If we already knew about this file, skip (e.g. sync, template, etc.)
-        if (this.knownFiles.has(file.path)) return;
-
-        // Add to known set immediately so we don't process it twice
-        this.knownFiles.add(file.path);
-
-        // The basename (without extension) is the link target text
-        const newFileName = file.basename;
-
-        // Small delay to let Obsidian finish its own file-creation housekeeping
-        await sleep(200);
-
-        // 1. Patch the source file(s): rewrite unresolved links that pointed here
-        await this.patchSourceLinks(newFileName, file);
-
-        // 2. Add alias to the new file's frontmatter
-        await this.addAliasFrontmatter(file, newFileName);
-      })
-    );
-
-    // Also track deletions so knownFiles stays accurate
     this.registerEvent(
       this.app.vault.on("delete", (file) => {
         if (file instanceof TFile) {
@@ -60,7 +65,6 @@ export default class AliasOnCreatePlugin extends Plugin {
       })
     );
 
-    // Track renames
     this.registerEvent(
       this.app.vault.on("rename", (file, oldPath) => {
         this.knownFiles.delete(oldPath);
@@ -76,41 +80,64 @@ export default class AliasOnCreatePlugin extends Plugin {
   }
 
   /**
-   * Search all markdown files for wikilinks like [[newFileName]] (without an
-   * existing alias) and rewrite them to [[newFileName|newFileName]].
+   * Scan the vault for all wikilinks pointing to linkText.
+   * Collects the display text for each link:
+   *   [[Cloud computing]]                → alias "Cloud computing"
+   *   [[Cloud computing|cloud stuff]]     → alias "cloud stuff"
+   *   [[Cloud computing#heading]]         → alias "Cloud computing"
+   *   [[Cloud computing#heading|my text]] → alias "my text"
    *
-   * We only patch links that are *exact* matches to the new file's basename,
-   * and that don't already have a pipe alias.
+   * Returns { hasLinks: boolean, aliases: string[] } with deduplicated aliases.
    */
-  private async patchSourceLinks(linkText: string, newFile: TFile): Promise<void> {
+  private async findMatchingLinks(linkText: string, newFile: TFile): Promise<{ hasLinks: boolean; aliases: string[] }> {
+    const mdFiles = this.app.vault.getMarkdownFiles();
+    const aliasSet = new Set<string>();
+    let hasLinks = false;
+
+    const escaped = linkText.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const pattern = new RegExp(
+      "\\[\\[" + escaped + "(#[^\\]|]*)?(\\|([^\\]]+))?\\]\\]",
+      "g"
+    );
+
+    for (const mdFile of mdFiles) {
+      if (mdFile.path === newFile.path) continue;
+
+      const content = await this.app.vault.read(mdFile);
+      if (!content.includes(`[[${linkText}`)) continue;
+
+      let match;
+      while ((match = pattern.exec(content)) !== null) {
+        hasLinks = true;
+        const alias = match[3] ? match[3] : linkText;
+        aliasSet.add(alias);
+      }
+    }
+
+    return { hasLinks, aliases: Array.from(aliasSet) };
+  }
+
+  /**
+   * Rewrite bare [[linkText]] links to [[linkText|linkText]].
+   * Links that already have a pipe alias are left untouched.
+   */
+  private async patchBareLinks(linkText: string, newFile: TFile): Promise<void> {
     const mdFiles = this.app.vault.getMarkdownFiles();
     let patchedCount = 0;
 
     for (const mdFile of mdFiles) {
-      // Don't patch the newly created file itself
       if (mdFile.path === newFile.path) continue;
 
       const content = await this.app.vault.read(mdFile);
-
-      // Quick pre-check to avoid unnecessary regex work
       if (!content.includes(`[[${linkText}`)) continue;
 
-      // We need to be careful not to match links that already have aliases.
-      // Strategy: replace [[linkText]] and [[linkText#heading]] patterns,
-      // but skip [[linkText|alias]] patterns.
       const newContent = content.replace(
         /\[\[([^\]|]*?)(\|[^\]]*)?\]\]/g,
-        (match, target, alias) => {
-          // If there's already an alias, leave it alone
+        (match: string, target: string, alias: string) => {
           if (alias) return match;
 
-          // Extract just the filename part (before any #heading)
           const filenamePart = target.split("#")[0];
-
-          // Check if this link points to our new file
           if (filenamePart === linkText) {
-            // Rewrite: [[effort]] → [[effort|effort]]
-            // or [[effort#heading]] → [[effort#heading|effort]]
             return `[[${target}|${linkText}]]`;
           }
 
@@ -125,29 +152,22 @@ export default class AliasOnCreatePlugin extends Plugin {
     }
 
     if (patchedCount > 0) {
-      new Notice(`Alias on Create: patched ${patchedCount} file(s) with alias for "${linkText}"`);
+      console.log(`Alias on Create: patched ${patchedCount} file(s) with alias for "${linkText}"`);
     }
   }
 
   /**
-   * Add (or merge into) the frontmatter of the new file so it contains
-   * the original link text as an alias.
+   * Add a single alias to the file's frontmatter, if not already present.
    */
   private async addAliasFrontmatter(file: TFile, aliasText: string): Promise<void> {
     let content = await this.app.vault.read(file);
 
-    // Check if the file already has frontmatter
     const fmMatch = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
 
     if (fmMatch) {
-      // Frontmatter exists — check for existing aliases field
       const fmBody = fmMatch[1];
 
       if (/^aliases\s*:/m.test(fmBody)) {
-        // aliases field exists — append our alias if not already present
-        // Handle both YAML list styles:
-        //   aliases: [a, b]    (inline)
-        //   aliases:\n  - a    (block)
         const inlineMatch = fmBody.match(/^(aliases\s*:\s*)\[([^\]]*)\]/m);
         if (inlineMatch) {
           const existing = inlineMatch[2]
@@ -161,7 +181,6 @@ export default class AliasOnCreatePlugin extends Plugin {
             content = content.replace(fmMatch[1], newFmBody);
           }
         } else {
-          // Block-style aliases — check if alias already there
           const blockLines = fmBody.split("\n");
           const aliasIdx = blockLines.findIndex((l: string) => /^aliases\s*:/.test(l));
           const existingAliases: string[] = [];
@@ -174,20 +193,17 @@ export default class AliasOnCreatePlugin extends Plugin {
             }
           }
           if (!existingAliases.includes(aliasText)) {
-            // Insert a new "  - alias" line after the last alias entry
-            let insertIdx = aliasIdx + 1 + existingAliases.length;
+            const insertIdx = aliasIdx + 1 + existingAliases.length;
             blockLines.splice(insertIdx, 0, `  - ${aliasText}`);
             const newFmBody = blockLines.join("\n");
             content = content.replace(fmMatch[1], newFmBody);
           }
         }
       } else {
-        // No aliases field yet — add one
         const newFmBody = fmBody + `\naliases:\n  - ${aliasText}`;
         content = content.replace(fmMatch[1], newFmBody);
       }
     } else {
-      // No frontmatter at all — prepend it
       content = `---\naliases:\n  - ${aliasText}\n---\n${content}`;
     }
 
@@ -195,9 +211,6 @@ export default class AliasOnCreatePlugin extends Plugin {
   }
 }
 
-/**
- * Simple async sleep helper.
- */
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
