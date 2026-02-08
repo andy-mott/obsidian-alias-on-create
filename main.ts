@@ -56,6 +56,10 @@ export default class AliasOnCreatePlugin extends Plugin {
           for (const alias of linkInfo.aliases) {
             await this.addAliasViaProcessFrontMatter(file, alias);
           }
+
+          // Guard: if another plugin (e.g., Templater on iCloud) modifies the
+          // file after we wrote, re-merge our aliases into the new content.
+          await this.guardAliases(file, linkInfo.aliases);
         })
       );
     });
@@ -196,6 +200,51 @@ export default class AliasOnCreatePlugin extends Plugin {
         console.log(`Alias on Create: max wait reached for "${file.basename}", proceeding`);
         done();
       }, maxWaitMs);
+    });
+  }
+
+  /**
+   * After writing aliases, watch for external modifications (e.g., Templater
+   * on iCloud vaults firing late) and re-merge aliases if needed.
+   *
+   * Removes the modify listener before re-merging to avoid catching our own write.
+   */
+  private guardAliases(file: TFile, aliases: string[], stabilizeMs = 500, maxGuardMs = 5000): Promise<void> {
+    return new Promise((resolve) => {
+      let stabilizeTimer: ReturnType<typeof setTimeout>;
+      let resolved = false;
+
+      const finish = async (shouldRemerge: boolean) => {
+        if (resolved) return;
+        resolved = true;
+        this.app.vault.offref(modifyRef);
+        clearTimeout(stabilizeTimer);
+        clearTimeout(maxTimer);
+        if (shouldRemerge) {
+          for (const alias of aliases) {
+            await this.addAliasViaProcessFrontMatter(file, alias);
+          }
+          console.log(`Alias on Create: re-merged aliases after external modification to "${file.basename}"`);
+        }
+        resolve();
+      };
+
+      const modifyRef = this.app.vault.on("modify", (modifiedFile) => {
+        if (!(modifiedFile instanceof TFile)) return;
+        if (modifiedFile.path !== file.path) return;
+        console.log(`Alias on Create: "${file.basename}" was modified after alias write, will re-merge`);
+        clearTimeout(stabilizeTimer);
+        stabilizeTimer = setTimeout(() => finish(true), stabilizeMs);
+      });
+
+      // If nothing modifies the file, just resolve (no extra delay, no re-merge)
+      stabilizeTimer = setTimeout(() => finish(false), stabilizeMs);
+
+      // Hard ceiling: never guard longer than maxGuardMs total
+      const maxTimer = setTimeout(() => {
+        console.log(`Alias on Create: guard period ended for "${file.basename}"`);
+        finish(false);
+      }, maxGuardMs);
     });
   }
 

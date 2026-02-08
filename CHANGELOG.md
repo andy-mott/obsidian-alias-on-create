@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.2.1] - 2026-02-08
+
+### Fixed
+- Fixed Templater compatibility on iCloud-synced vaults. On iCloud, filesystem
+  event latency caused the plugin to write before Templater finished, overwriting
+  template properties. The plugin now guards aliases after writing: if another
+  plugin modifies the file afterward, aliases are re-merged into the new content.
+
 ## [1.2.0] - 2026-02-08
 
 ### Fixed
