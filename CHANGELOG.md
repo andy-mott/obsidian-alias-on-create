@@ -1,5 +1,23 @@
 # Changelog
 
+## [1.2.0] - 2026-02-08
+
+### Fixed
+- Fixed compatibility with Templater default folder templates. Previously, this
+  plugin's 300ms delay was too short — it would write alias-only frontmatter
+  before Templater finished applying its template, causing the template properties
+  (tags, status, etc.) to be lost.
+- The plugin now watches for file modifications after creation and waits for
+  content to stabilize before adding aliases, allowing Templater (or any other
+  plugin) to finish first.
+
+### Changed
+- Replaced manual regex-based frontmatter parsing with Obsidian's built-in
+  `processFrontMatter` API for safer, atomic read-modify-write operations that
+  preserve all existing frontmatter fields.
+- Removed the fixed `sleep(300)` delay in favor of an event-driven stabilization
+  approach (500ms of no modifications, 5s hard cap).
+
 ## [1.1.0] - 2026-02-05
 
 ### Added

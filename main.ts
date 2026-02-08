@@ -1,4 +1,4 @@
-import { Plugin, TFile, Notice } from "obsidian";
+import { Plugin, TFile } from "obsidian";
 
 /**
  * Alias on Create
@@ -37,7 +37,10 @@ export default class AliasOnCreatePlugin extends Plugin {
 
           const newFileName = file.basename;
 
-          await sleep(300);
+          // Wait for other plugins (e.g., Templater) to finish modifying the file.
+          // Watches for modify events and waits until content has been stable
+          // (no modifications) for 500ms, up to a max of 5s.
+          await this.waitForFileStable(file);
 
           const linkInfo = await this.findMatchingLinks(newFileName, file);
 
@@ -51,7 +54,7 @@ export default class AliasOnCreatePlugin extends Plugin {
           await this.patchBareLinks(newFileName, file);
 
           for (const alias of linkInfo.aliases) {
-            await this.addAliasFrontmatter(file, alias);
+            await this.addAliasViaProcessFrontMatter(file, alias);
           }
         })
       );
@@ -157,60 +160,60 @@ export default class AliasOnCreatePlugin extends Plugin {
   }
 
   /**
-   * Add a single alias to the file's frontmatter, if not already present.
+   * Wait for a newly created file's content to stabilize.
+   *
+   * After file creation, other plugins (e.g., Templater) may modify the file.
+   * This method listens for modify events and waits until no modifications
+   * have occurred for `stabilizeMs` milliseconds, or until `maxWaitMs` is reached.
    */
-  private async addAliasFrontmatter(file: TFile, aliasText: string): Promise<void> {
-    let content = await this.app.vault.read(file);
+  private waitForFileStable(file: TFile, stabilizeMs = 500, maxWaitMs = 5000): Promise<void> {
+    return new Promise((resolve) => {
+      let stabilizeTimer: ReturnType<typeof setTimeout>;
+      let resolved = false;
 
-    const fmMatch = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+      const done = () => {
+        if (resolved) return;
+        resolved = true;
+        this.app.vault.offref(modifyRef);
+        clearTimeout(stabilizeTimer);
+        clearTimeout(maxTimer);
+        resolve();
+      };
 
-    if (fmMatch) {
-      const fmBody = fmMatch[1];
+      const modifyRef = this.app.vault.on("modify", (modifiedFile) => {
+        if (!(modifiedFile instanceof TFile)) return;
+        if (modifiedFile.path !== file.path) return;
+        console.log(`Alias on Create: "${file.basename}" was modified by another plugin, resetting stabilization timer`);
+        clearTimeout(stabilizeTimer);
+        stabilizeTimer = setTimeout(done, stabilizeMs);
+      });
 
-      if (/^aliases\s*:/m.test(fmBody)) {
-        const inlineMatch = fmBody.match(/^(aliases\s*:\s*)\[([^\]]*)\]/m);
-        if (inlineMatch) {
-          const existing = inlineMatch[2]
-            .split(",")
-            .map((s: string) => s.trim().replace(/^['"]|['"]$/g, ""))
-            .filter(Boolean);
-          if (!existing.includes(aliasText)) {
-            existing.push(aliasText);
-            const newAliases = `aliases: [${existing.join(", ")}]`;
-            const newFmBody = fmBody.replace(/^aliases\s*:\s*\[[^\]]*\]/m, newAliases);
-            content = content.replace(fmMatch[1], newFmBody);
-          }
-        } else {
-          const blockLines = fmBody.split("\n");
-          const aliasIdx = blockLines.findIndex((l: string) => /^aliases\s*:/.test(l));
-          const existingAliases: string[] = [];
-          for (let i = aliasIdx + 1; i < blockLines.length; i++) {
-            const m = blockLines[i].match(/^\s*-\s+(.*)/);
-            if (m) {
-              existingAliases.push(m[1].replace(/^['"]|['"]$/g, ""));
-            } else {
-              break;
-            }
-          }
-          if (!existingAliases.includes(aliasText)) {
-            const insertIdx = aliasIdx + 1 + existingAliases.length;
-            blockLines.splice(insertIdx, 0, `  - ${aliasText}`);
-            const newFmBody = blockLines.join("\n");
-            content = content.replace(fmMatch[1], newFmBody);
-          }
-        }
-      } else {
-        const newFmBody = fmBody + `\naliases:\n  - ${aliasText}`;
-        content = content.replace(fmMatch[1], newFmBody);
-      }
-    } else {
-      content = `---\naliases:\n  - ${aliasText}\n---\n${content}`;
-    }
+      // If nothing modifies the file within stabilizeMs, proceed
+      stabilizeTimer = setTimeout(done, stabilizeMs);
 
-    await this.app.vault.modify(file, content);
+      // Hard ceiling: never wait longer than maxWaitMs total
+      const maxTimer = setTimeout(() => {
+        console.log(`Alias on Create: max wait reached for "${file.basename}", proceeding`);
+        done();
+      }, maxWaitMs);
+    });
   }
-}
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+  /**
+   * Add a single alias to the file's frontmatter using Obsidian's
+   * processFrontMatter API for atomic read-modify-write.
+   */
+  private async addAliasViaProcessFrontMatter(file: TFile, aliasText: string): Promise<void> {
+    await this.app.fileManager.processFrontMatter(file, (frontmatter) => {
+      if (!frontmatter.aliases) {
+        frontmatter.aliases = [];
+      }
+      if (typeof frontmatter.aliases === "string") {
+        frontmatter.aliases = [frontmatter.aliases];
+      }
+      if (!frontmatter.aliases.includes(aliasText)) {
+        frontmatter.aliases.push(aliasText);
+      }
+    });
+  }
 }
